@@ -1,7 +1,7 @@
 name: metrics
 
-# Карточка метрик организации candycate-studio (lowlighter/metrics):
-# активность, языки, репозитории. Пишет profile/assets/metrics.svg.
+# Карточка метрик организации (lowlighter/metrics): активность, языки, репозитории.
+# БЕЗ header — иконка/имя/участники не показываются. Пишет profile/assets/metrics.svg.
 #
 # Guard: пока секрет ORG_METRICS_TOKEN не добавлен, шаг с метриками
 # пропускается — плановые прогоны остаются зелёным no-op.
@@ -27,7 +27,7 @@ jobs:
           token: ${{ secrets.ORG_METRICS_TOKEN }}
           user: candycate-studio
           template: classic
-          base: "header, activity, community, repositories"
+          base: "activity, community, repositories"
           plugin_languages: yes
           plugin_lines: yes
           filename: profile/assets/metrics.svg
