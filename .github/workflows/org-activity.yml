@@ -1,0 +1,47 @@
+name: org-activity
+
+# Живой heatmap git-активности организации candycate-studio.
+# Пересобирает profile/assets/org-activity.svg — агрегат коммитов по всем
+# репозиториям Org за последние 52 недели (scripts/org_activity.py).
+#
+# Без секрета ORG_METRICS_TOKEN скрипт молча завершается (no-op, exit 0) —
+# это ожидаемо до того, как секрет добавят в настройки репозитория/организации.
+
+on:
+  workflow_dispatch: {}
+  schedule:
+    - cron: "17 4 * * *"
+
+permissions:
+  contents: write
+
+jobs:
+  refresh:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Установить Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Собрать heatmap активности
+        env:
+          GH_TOKEN: ${{ secrets.ORG_METRICS_TOKEN }}
+        run: python scripts/org_activity.py
+
+      - name: Закоммитить, если файл изменился
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add profile/assets/org-activity.svg
+          if git diff --cached --quiet; then
+            echo "Изменений нет — коммит пропущен."
+            exit 0
+          fi
+          git commit -m "chore(profile): refresh org-activity heatmap"
+          git push
