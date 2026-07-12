@@ -1,6 +1,6 @@
-<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 680 190" font-family="Verdana,'DejaVu Sans',system-ui,sans-serif" role="img" aria-label="CandyCate Studio">
-  <title>CandyCate Studio</title>
-  <g transform="translate(96,96)">
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 500 128" font-family="Verdana,'DejaVu Sans',system-ui,sans-serif" role="img" aria-label="CandyCate">
+  <title>CandyCate</title>
+  <g transform="translate(66,64) scale(0.82)">
     <g fill="#43b7a4">
       <path d="M40,-44 q28,-20 48,-9 q-15,7 -17,24 q-17,-12 -31,-15 z"/>
       <path d="M-40,44 q-28,20 -48,9 q15,-7 17,-24 q17,12 31,15 z"/>
@@ -9,7 +9,5 @@
     <path d="M0,-41 A41,41 0 1 1 -29,29 A29,29 0 1 0 21,-15 A17,17 0 1 1 -9,17" fill="none" stroke="#d8285a" stroke-width="11" stroke-linecap="round"/>
     <circle r="6.5" fill="#d8285a"/>
   </g>
-  <text x="184" y="93" font-size="57" font-weight="800" letter-spacing="-1"><tspan fill="#d8285a">Candy</tspan><tspan fill="#43b7a4">Cate</tspan></text>
-  <text x="186" y="128" font-size="19" font-weight="600" fill="#8a8178">малая творческая студия</text>
-  <text x="186" y="153" font-size="14.5" fill="#a89f94">истории · игры · приложения · devkit · боты</text>
+  <text x="138" y="83" font-size="55" font-weight="800" letter-spacing="-1"><tspan fill="#d8285a">Candy</tspan><tspan fill="#43b7a4">Cate</tspan></text>
 </svg>
