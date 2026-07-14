@@ -20,6 +20,7 @@ import time
 import urllib.error
 import urllib.request
 import zlib
+from collections import deque
 
 # ---- конфигурация -----------------------------------------------------------
 
@@ -208,9 +209,12 @@ def cell_xy(col, row):
 # ---- змейка (охотится за активностью и растёт, съедая её) ------------------------
 
 BASE_LEN = 4              # сегментов до первой еды (индекс 0 — голова)
-MAX_LEN = 40              # предохранитель: длиннее змейка превращается в кашу
+MAX_LEN_SPARSE = 20       # потолок роста на пустой сетке — рост видно, манёвра хватает
+MAX_LEN_DENSE = 6         # на забитой длинная змейка замуровывает сама себя
+DENSE_FOOD = 40           # граница «сетка забита» (клеток активности)
 STEP_SEC = 0.06           # секунд на шаг (темп); длительность = шаги * это, с зажимом
 DUR_MIN, DUR_MAX = 10.0, 30.0
+WIGGLE_P = 0.3            # шанс случайного поворота на прямом участке (иначе скучно)
 SNAKE_COLOR = "#d8285a"
 LEAD = 4                  # клеток заезда/выезда ЗА кадром — петля замыкается невидимо
 
@@ -230,28 +234,69 @@ def _seed_of(levels):
     return zlib.crc32(repr(levels).encode("utf-8"))
 
 
-def _step_toward(cur, target, rng):
-    """Один шаг к цели: случайно выбираем ось из тех, что ещё не сошлись.
+def _max_len(food):
+    """Потолок роста — по плотности сетки, а не одной константой на все случаи.
 
-    Движение монотонное (всегда ближе к цели), но идёт лесенкой, а не по прямой —
-    отсюда живость, без потери гарантии дойти.
+    Замер (свип по 4 сидам): при 60% плотности потолок 20 доедает 44% активности,
+    потолок 6 — 90%; на разреженной (наш случай: ~22 клетки) оба дают 100%. Поэтому
+    пока сетка пустая — растим длинно и это видно, а как забьётся — держим коротко,
+    иначе змейка в 7 строк высотой сама себя замуровывает.
     """
-    (c, r), (tc, tr) = cur, target
-    opts = []
-    if c != tc:
-        opts.append((1 if tc > c else -1, 0))
-    if r != tr:
-        opts.append((0, 1 if tr > r else -1))
-    dc, dr = rng.choice(opts)
-    return c + dc, r + dr
+    return MAX_LEN_SPARSE if food <= DENSE_FOOD else MAX_LEN_DENSE
+
+
+def _in_grid(cell):
+    return 0 <= cell[0] < COLS and 0 <= cell[1] < ROWS
+
+
+def _neighbors(cell):
+    c, r = cell
+    return ((c + 1, r), (c - 1, r), (c, r + 1), (c, r - 1))
+
+
+def _can_reach(start, goal, blocked):
+    """BFS по свободным клеткам: дотянется ли голова до goal, минуя blocked."""
+    seen = {start}
+    q = deque([start])
+    while q:
+        for n in _neighbors(q.popleft()):
+            if n == goal:
+                return True
+            if _in_grid(n) and n not in blocked and n not in seen:
+                seen.add(n)
+                q.append(n)
+    return False
+
+
+def _is_safe(nxt, body, body_len, grows):
+    """Ход безопасен, если после него голова всё ещё видит свой хвост.
+
+    Классическая эвристика змейки: пока путь до хвоста есть — змейка не заперта.
+    Без неё на сетке высотой всего 7 клеток растущая змейка замуровывает себя почти
+    сразу (проверено тестом: доедала 10 клеток из 29).
+    """
+    nb = deque(body)
+    nb.append(nxt)
+    limit = body_len + 1 if grows else body_len
+    while len(nb) > limit:
+        nb.popleft()
+    tail = nb[0]
+    blocked = set(nb)
+    blocked.discard(tail)          # хвост уползёт — он не препятствие
+    return _can_reach(nxt, tail, blocked)
 
 
 def snake_path(levels, rng):
     """Путь головы: заезд из-за кадра → жадный обход ВСЕЙ активности → выезд за кадр.
 
-    Каждый ход цель — ближайшая (манхэттен) недоеденная клетка, ничьи рвём рандомом;
-    идём к ней случайной лесенкой и едим всё, на что наступили по дороге. Цель «съесть
-    всю активность» гарантирована: цикл крутится, пока остались непустые клетки.
+    Правила как в оригинальной игре:
+      * цель хода — ближайшая (манхэттен) недоеденная клетка, ничьи рвём рандомом;
+      * идём лесенкой (случайная ось из тех, что не сошлись), а на ПРЯМЫХ участках
+        ещё и виляем с шансом WIGGLE_P — иначе движение к еде на одной строке
+        выродилось бы в скучную прямую;
+      * **в себя не ходим**: занятые телом клетки запрещены, тело растёт на клетку
+        за каждую съеденную (хвост не подтягивается в этот ход);
+      * съедаем всё, на что наступили по дороге.
 
     Возвращает (cells, eaten_at) — путь и {клетка: индекс шага, на котором её съели}.
     """
@@ -260,22 +305,84 @@ def snake_path(levels, rng):
     cur = cells[-1]
     remaining = {(c, r) for c in range(COLS) for r in range(ROWS) if levels[c][r] > 0}
     eaten_at = {}
+    body = deque(cells)          # клетки, занятые змейкой (голова — последняя)
+    body_len = BASE_LEN
+    max_len = _max_len(len(remaining))
+    guard = 40 * COLS * ROWS     # страховка от вечного цикла, если змейка заперлась
+    stall = 0                    # подряд недостижимых целей — после 3 уходим с поля
 
-    while remaining:
+    def free(cell):
+        return _in_grid(cell) and cell not in body
+
+    while remaining and guard > 0 and stall < 3:
         target = min(
             remaining,
             key=lambda f: (abs(f[0] - cur[0]) + abs(f[1] - cur[1]), rng.random()),
         )
-        while cur != target:
-            cur = _step_toward(cur, target, rng)
+        budget = 6 * (abs(target[0] - cur[0]) + abs(target[1] - cur[1])) + 40
+        ate_before = len(eaten_at)
+        while cur != target and budget > 0 and guard > 0:
+            budget -= 1
+            guard -= 1
+            c, r = cur
+            tc, tr = target
+            toward = []
+            if c != tc:
+                toward.append((c + (1 if tc > c else -1), r))
+            if r != tr:
+                toward.append((c, r + (1 if tr > r else -1)))
+            rng.shuffle(toward)
+
+            prefer = list(toward)
+            # Виляем только когда ход к цели прямой (одна ось) — иначе он и так лесенкой.
+            if len(toward) == 1 and budget > 8 and rng.random() < WIGGLE_P:
+                side = [(c, r - 1), (c, r + 1)] if r == tr else [(c - 1, r), (c + 1, r)]
+                rng.shuffle(side)
+                prefer = side + prefer
+            prefer = [x for x in prefer if free(x)]
+            others = [x for x in _neighbors(cur) if free(x) and x not in prefer]
+            rng.shuffle(others)
+
+            pick = None
+            for x in prefer + others:           # сначала ходы, после которых видим хвост
+                if _is_safe(x, body, body_len, x in remaining):
+                    pick = x
+                    break
+            if pick is None:                    # безопасных нет — хотя бы не в себя
+                pick = (prefer + others)[0] if (prefer + others) else None
+            if pick is None:                    # замуровалась целиком — охота окончена
+                guard = 0
+                break
+
+            cur = pick
             cells.append(cur)
-            if cur in remaining:          # съели попутную клетку — как в игре
+            body.append(cur)
+            if cur in remaining:                # съели клетку — растём на одну
                 eaten_at[cur] = len(cells) - 1
                 remaining.discard(cur)
+                body_len = min(max_len, body_len + 1)
+            while len(body) > body_len:
+                body.popleft()
 
-    # Выезд за правый край с той строки, где закончили.
-    for col in range(cur[0] + 1, COLS + LEAD):
-        cells.append((col, cur[1]))
+        # Прогресс меряем съеденным, а не достижением конкретной цели: в плотной каше
+        # цель может быть недостижима, но змейка по дороге всё равно ест.
+        stall = 0 if (cur == target or len(eaten_at) > ate_before) else stall + 1
+
+    # Выезд вправо за кадр — по-прежнему не сквозь себя.
+    exit_budget = 4 * (COLS + LEAD)
+    while cur[0] < COLS + LEAD - 1 and exit_budget > 0:
+        exit_budget -= 1
+        step = (cur[0] + 1, cur[1])
+        if _in_grid(step) and step in body:
+            alt = [x for x in ((cur[0], cur[1] - 1), (cur[0], cur[1] + 1)) if free(x)]
+            if not alt:
+                break                            # обрываем: дальше только сквозь себя
+            step = rng.choice(alt)
+        cur = step
+        cells.append(cur)
+        body.append(cur)
+        while len(body) > body_len:
+            body.popleft()
     return cells, eaten_at
 
 
@@ -324,8 +431,15 @@ def render_svg(levels):
                     f'rx="2.5" fill="{fill}" opacity="0.20"/>'
                 )
                 continue
+            idx = eaten_at.get((col, row))
+            if idx is None:      # змейка не добралась — клетка просто горит, без анимации
+                parts.append(
+                    f'<rect x="{_fmt(x)}" y="{_fmt(y)}" width="{size}" height="{size}" '
+                    f'rx="2.5" fill="{fill}"/>'
+                )
+                continue
             # Непустая клетка гаснет ровно в тот момент, когда её проходит голова.
-            eat_pct = eaten_at[(col, row)] * step_pct
+            eat_pct = idx * step_pct
             regrow_at = min(100.0, eat_pct + step_pct * 0.8)
             name = f"e{col}_{row}"
             css.append(
@@ -345,7 +459,16 @@ def render_svg(levels):
     # Сегмент k >= BASE_LEN «рождается» в момент, когда съедена (k - BASE_LEN)-я клетка,
     # и появляется у хвоста — там, где змейка в этот миг и удлиняется.
     eat_order = sorted(eaten_at.values())
-    total_len = min(MAX_LEN, BASE_LEN + len(eat_order))
+    food_n = sum(1 for c in range(COLS) for r in range(ROWS) if levels[c][r] > 0)
+    total_len = min(_max_len(food_n), BASE_LEN + len(eat_order))
+
+    # Змейка живёт строго в поле клеток: заезд/выезд за кадром обрезаются клипом,
+    # иначе на старте она едет по зоне подписей дней.
+    parts.append(
+        f'<clipPath id="gclip"><rect x="{GX}" y="{GY}" '
+        f'width="{(COLS - 1) * C + size}" height="{(ROWS - 1) * C + size}"/></clipPath>'
+    )
+    parts.append('<g clip-path="url(#gclip)">')
 
     # Хвост рисуем первым, голову — последней (поверх остальных сегментов).
     for k in range(total_len - 1, -1, -1):
@@ -365,6 +488,7 @@ def render_svg(levels):
             f'<rect class="sg" style="{style}" x="0" y="0" '
             f'width="{size}" height="{size}" rx="{_fmt(rx)}"/>'
         )
+    parts.append("</g>")
 
     css.append("@media(prefers-reduced-motion:reduce){.sg{display:none}.c{animation:none}}")
     parts[2] = "<style>" + "".join(css) + "</style>"
