@@ -203,10 +203,35 @@ def cell_xy(col, row):
     return GX + col * C, GY + row * C
 
 
-def cell_center(col, row):
-    x, y = cell_xy(col, row)
-    off = (C - PAD) / 2
-    return x + off, y + off
+# ---- змейка (snk-style: ползёт по сетке и «съедает» клетки) ----------------------
+
+SNAKE_LEN = 5             # сегментов тела (индекс 0 — голова)
+SNAKE_DURATION = 20.0     # секунд на полный проход сетки
+SNAKE_COLOR = "#d8285a"
+LEAD = 4                  # клеток заезда/выезда ЗА кадром — петля замыкается невидимо
+
+
+def _pct(v):
+    """Компактное число для CSS — без хвостовых нулей."""
+    r = round(v, 3)
+    return str(int(r)) if r == int(r) else f"{r:g}"
+
+
+def snake_path():
+    """Путь головы: заезд из-за левого края → серпантин по всем клеткам
+    (колонка сверху-вниз, следующая снизу-вверх) → выезд за правый край.
+
+    Оба конца пути лежат вне viewBox, поэтому «прыжок» петли 100%→0% зритель
+    не видит, а съеденные клетки успевают отрасти обратно за кадром.
+    """
+    cells = [(-i, 0) for i in range(LEAD, 0, -1)]
+    last_row = 0
+    for col in range(COLS):
+        rows = list(range(ROWS)) if col % 2 == 0 else list(range(ROWS - 1, -1, -1))
+        cells.extend((col, row) for row in rows)
+        last_row = rows[-1]
+    cells.extend((COLS - 1 + i, last_row) for i in range(1, LEAD + 1))
+    return cells
 
 
 def render_svg(levels):
@@ -214,10 +239,32 @@ def render_svg(levels):
     height = GY + ROWS * C + 4
     size = C - PAD
 
+    path = snake_path()
+    steps = len(path) - 1
+    step_pct = 100.0 / steps
+    step_sec = SNAKE_DURATION / steps
+    idx_of = {cell: i for i, cell in enumerate(path) if 0 <= cell[0] < COLS}
+
+    dur = _pct(SNAKE_DURATION)
+    css = [
+        f".c{{animation-duration:{dur}s;animation-timing-function:linear;"
+        f"animation-iteration-count:infinite}}",
+        f".sg{{transform-box:view-box;transform-origin:0 0;fill:{SNAKE_COLOR};"
+        f"animation:snk {dur}s linear infinite}}",
+    ]
+
+    # Один @keyframes на всю змейку — сегменты расходятся через animation-delay.
+    kf = []
+    for i, (col, row) in enumerate(path):
+        x, y = cell_xy(col, row)
+        kf.append(f"{_pct(i * step_pct)}%{{transform:translate({_fmt(x)}px,{_fmt(y)}px)}}")
+    css.append("@keyframes snk{" + "".join(kf) + "}")
+
     parts = [
         f'<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 {width} {height}" '
-        f'role="img" aria-label="git-активность {ORG} за год со змейкой">',
+        f'role="img" aria-label="git-активность {ORG} за год: змейка съедает клетки коммитов">',
         f"<title>git-активность {ORG}</title>",
+        "",  # место под <style> — заполняется ниже, когда css собран
     ]
 
     for col in range(COLS):
@@ -225,30 +272,39 @@ def render_svg(levels):
             x, y = cell_xy(col, row)
             level = levels[col][row]
             fill = RAMP[level]
-            opacity = ' opacity="0.20"' if level == 0 else ""
+            if level == 0:
+                parts.append(
+                    f'<rect x="{_fmt(x)}" y="{_fmt(y)}" width="{size}" height="{size}" '
+                    f'rx="2.5" fill="{fill}" opacity="0.20"/>'
+                )
+                continue
+            # Непустая клетка гаснет ровно в тот момент, когда её проходит голова.
+            eaten_at = idx_of[(col, row)] * step_pct
+            regrow_at = min(100.0, eaten_at + step_pct * 0.8)
+            name = f"e{col}_{row}"
+            css.append(
+                f"@keyframes {name}{{0%,{_pct(eaten_at)}%{{fill:{fill};opacity:1}}"
+                f"{_pct(regrow_at)}%,100%{{fill:{RAMP[0]};opacity:.2}}}}"
+            )
             parts.append(
                 f'<rect x="{_fmt(x)}" y="{_fmt(y)}" width="{size}" height="{size}" '
-                f'rx="2.5" fill="{fill}"{opacity}/>'
+                f'rx="2.5" fill="{fill}" class="c" style="animation-name:{name}"/>'
             )
-
-    # Статичная декоративная змейка поверх нескольких ячеек — не завязана на данные,
-    # как и в исходном плейсхолдере.
-    snake_rows = [3, 2, 3, 4, 3, 2, 3, 4]
-    start_col = max(0, min(15, COLS - len(snake_rows)))
-    points = [cell_center(start_col + i, r) for i, r in enumerate(snake_rows)]
-    stroke_w = size + 1
-    pts_str = " ".join(f"{_fmt(x)},{_fmt(y)}" for x, y in points)
-    parts.append(
-        f'<polyline points="{pts_str}" fill="none" stroke="#d8285a" '
-        f'stroke-width="{stroke_w}" stroke-linecap="round" stroke-linejoin="round" opacity="0.92"/>'
-    )
-    hx, hy = points[-1]
-    head_r = stroke_w / 2 + 1
-    parts.append(f'<circle cx="{_fmt(hx)}" cy="{_fmt(hy)}" r="{head_r:.1f}" fill="#d8285a"/>')
 
     for row, label in sorted(DAY_LABELS.items()):
         baseline = GY + row * C + (C - PAD) - 2.5
         parts.append(f'<text x="3" y="{_fmt(baseline)}" font-size="9" fill="#8b95a1">{label}</text>')
+
+    # Хвост рисуем первым, голову — последней (поверх остальных сегментов).
+    for k in range(SNAKE_LEN - 1, -1, -1):
+        parts.append(
+            f'<rect class="sg" style="animation-delay:{k * step_sec:.3f}s;'
+            f'opacity:{_pct(round(1.0 - k * 0.16, 2))}" x="0" y="0" '
+            f'width="{size}" height="{size}" rx="{_fmt(size / 2 if k == 0 else 3)}"/>'
+        )
+
+    css.append("@media(prefers-reduced-motion:reduce){.sg{display:none}.c{animation:none}}")
+    parts[2] = "<style>" + "".join(css) + "</style>"
 
     parts.append("</svg>")
     return "\n".join(parts) + "\n"
