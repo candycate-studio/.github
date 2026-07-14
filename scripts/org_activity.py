@@ -314,6 +314,53 @@ def snake_path(levels, rng):
     def free(cell):
         return _in_grid(cell) and cell not in body
 
+    def step_once(target, wiggle, budget_left):
+        """Один безопасный шаг к цели. False — ходить совсем некуда.
+
+        Используется и на охоте, и на выезде: наивный «иди вправо» на выезде
+        упирался в собственное тело, если змейка доела, свернувшись клубком.
+        """
+        nonlocal cur, body_len
+        c, r = cur
+        tc, tr = target
+        toward = []
+        if c != tc:
+            toward.append((c + (1 if tc > c else -1), r))
+        if r != tr:
+            toward.append((c, r + (1 if tr > r else -1)))
+        rng.shuffle(toward)
+
+        prefer = list(toward)
+        # Виляем только когда ход к цели прямой (одна ось) — иначе он и так лесенкой.
+        if wiggle and len(toward) == 1 and budget_left > 8 and rng.random() < WIGGLE_P:
+            side = [(c, r - 1), (c, r + 1)] if r == tr else [(c - 1, r), (c + 1, r)]
+            rng.shuffle(side)
+            prefer = side + prefer
+        prefer = [x for x in prefer if free(x)]
+        others = [x for x in _neighbors(cur) if free(x) and x not in prefer]
+        rng.shuffle(others)
+
+        pick = None
+        for x in prefer + others:          # сначала ходы, после которых видим хвост
+            if _is_safe(x, body, body_len, x in remaining):
+                pick = x
+                break
+        if pick is None:                   # безопасных нет — хотя бы не в себя
+            pick = (prefer + others)[0] if (prefer + others) else None
+        if pick is None:
+            return False
+
+        cur = pick
+        cells.append(cur)
+        body.append(cur)
+        if cur in remaining:               # съели клетку — растём на одну
+            eaten_at[cur] = len(cells) - 1
+            remaining.discard(cur)
+            body_len = min(max_len, body_len + 1)
+        while len(body) > body_len:
+            body.popleft()
+        return True
+
     while remaining and guard > 0 and stall < 3:
         target = min(
             remaining,
@@ -324,61 +371,29 @@ def snake_path(levels, rng):
         while cur != target and budget > 0 and guard > 0:
             budget -= 1
             guard -= 1
-            c, r = cur
-            tc, tr = target
-            toward = []
-            if c != tc:
-                toward.append((c + (1 if tc > c else -1), r))
-            if r != tr:
-                toward.append((c, r + (1 if tr > r else -1)))
-            rng.shuffle(toward)
-
-            prefer = list(toward)
-            # Виляем только когда ход к цели прямой (одна ось) — иначе он и так лесенкой.
-            if len(toward) == 1 and budget > 8 and rng.random() < WIGGLE_P:
-                side = [(c, r - 1), (c, r + 1)] if r == tr else [(c - 1, r), (c + 1, r)]
-                rng.shuffle(side)
-                prefer = side + prefer
-            prefer = [x for x in prefer if free(x)]
-            others = [x for x in _neighbors(cur) if free(x) and x not in prefer]
-            rng.shuffle(others)
-
-            pick = None
-            for x in prefer + others:           # сначала ходы, после которых видим хвост
-                if _is_safe(x, body, body_len, x in remaining):
-                    pick = x
-                    break
-            if pick is None:                    # безопасных нет — хотя бы не в себя
-                pick = (prefer + others)[0] if (prefer + others) else None
-            if pick is None:                    # замуровалась целиком — охота окончена
+            if not step_once(target, True, budget):   # замуровалась — охота окончена
                 guard = 0
                 break
-
-            cur = pick
-            cells.append(cur)
-            body.append(cur)
-            if cur in remaining:                # съели клетку — растём на одну
-                eaten_at[cur] = len(cells) - 1
-                remaining.discard(cur)
-                body_len = min(max_len, body_len + 1)
-            while len(body) > body_len:
-                body.popleft()
-
         # Прогресс меряем съеденным, а не достижением конкретной цели: в плотной каше
         # цель может быть недостижима, но змейка по дороге всё равно ест.
         stall = 0 if (cur == target or len(eaten_at) > ate_before) else stall + 1
 
-    # Выезд вправо за кадр — по-прежнему не сквозь себя.
-    exit_budget = 4 * (COLS + LEAD)
-    while cur[0] < COLS + LEAD - 1 and exit_budget > 0:
-        exit_budget -= 1
-        step = (cur[0] + 1, cur[1])
-        if _in_grid(step) and step in body:
-            alt = [x for x in ((cur[0], cur[1] - 1), (cur[0], cur[1] + 1)) if free(x)]
-            if not alt:
-                break                            # обрываем: дальше только сквозь себя
-            step = rng.choice(alt)
-        cur = step
+    # Выезд. Уводим за край не только голову, но и ВЕСЬ хвост: сегмент k отстаёт на k
+    # шагов, поэтому если гнать только голову, на 100% хвост ещё в сетке и петля
+    # 100%->0% выглядит рывком.
+    total_len = min(max_len, BASE_LEN + len(eaten_at))
+
+    # 1) К правому краю — тем же безопасным шагом: змейка могла доесть, свернувшись
+    #    клубком, и «иди вправо» напролом упирается в собственное тело.
+    edge_budget = 8 * COLS + 80
+    while _in_grid(cur) and cur[0] < COLS - 1 and edge_budget > 0:
+        edge_budget -= 1
+        if not step_once((COLS - 1, cur[1]), False, edge_budget):
+            break
+
+    # 2) Прямо за кадр: off-grid клетки телом не заняты, коллизий там нет.
+    while cur[0] < COLS + total_len + 1:
+        cur = (cur[0] + 1, cur[1])
         cells.append(cur)
         body.append(cur)
         while len(body) > body_len:
