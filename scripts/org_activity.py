@@ -14,10 +14,12 @@ org_activity.py — собирает агрегированную git-актив
 import json
 import math
 import os
+import random
 import sys
 import time
 import urllib.error
 import urllib.request
+import zlib
 
 # ---- конфигурация -----------------------------------------------------------
 
@@ -203,10 +205,12 @@ def cell_xy(col, row):
     return GX + col * C, GY + row * C
 
 
-# ---- змейка (snk-style: ползёт по сетке и «съедает» клетки) ----------------------
+# ---- змейка (охотится за активностью и растёт, съедая её) ------------------------
 
-SNAKE_LEN = 5             # сегментов тела (индекс 0 — голова)
-SNAKE_DURATION = 20.0     # секунд на полный проход сетки
+BASE_LEN = 4              # сегментов до первой еды (индекс 0 — голова)
+MAX_LEN = 40              # предохранитель: длиннее змейка превращается в кашу
+STEP_SEC = 0.06           # секунд на шаг (темп); длительность = шаги * это, с зажимом
+DUR_MIN, DUR_MAX = 10.0, 30.0
 SNAKE_COLOR = "#d8285a"
 LEAD = 4                  # клеток заезда/выезда ЗА кадром — петля замыкается невидимо
 
@@ -217,21 +221,62 @@ def _pct(v):
     return str(int(r)) if r == int(r) else f"{r:g}"
 
 
-def snake_path():
-    """Путь головы: заезд из-за левого края → серпантин по всем клеткам
-    (колонка сверху-вниз, следующая снизу-вверх) → выезд за правый край.
+def _seed_of(levels):
+    """Стабильный seed из самих данных: одинаковая сетка → одинаковый путь.
 
-    Оба конца пути лежат вне viewBox, поэтому «прыжок» петли 100%→0% зритель
-    не видит, а съеденные клетки успевают отрасти обратно за кадром.
+    Без этого рандом менял бы SVG на каждом прогоне, и Action коммитил бы
+    пустой дифф ежедневно. hash() не годится — он рандомизирован между запусками.
     """
-    cells = [(-i, 0) for i in range(LEAD, 0, -1)]
-    last_row = 0
-    for col in range(COLS):
-        rows = list(range(ROWS)) if col % 2 == 0 else list(range(ROWS - 1, -1, -1))
-        cells.extend((col, row) for row in rows)
-        last_row = rows[-1]
-    cells.extend((COLS - 1 + i, last_row) for i in range(1, LEAD + 1))
-    return cells
+    return zlib.crc32(repr(levels).encode("utf-8"))
+
+
+def _step_toward(cur, target, rng):
+    """Один шаг к цели: случайно выбираем ось из тех, что ещё не сошлись.
+
+    Движение монотонное (всегда ближе к цели), но идёт лесенкой, а не по прямой —
+    отсюда живость, без потери гарантии дойти.
+    """
+    (c, r), (tc, tr) = cur, target
+    opts = []
+    if c != tc:
+        opts.append((1 if tc > c else -1, 0))
+    if r != tr:
+        opts.append((0, 1 if tr > r else -1))
+    dc, dr = rng.choice(opts)
+    return c + dc, r + dr
+
+
+def snake_path(levels, rng):
+    """Путь головы: заезд из-за кадра → жадный обход ВСЕЙ активности → выезд за кадр.
+
+    Каждый ход цель — ближайшая (манхэттен) недоеденная клетка, ничьи рвём рандомом;
+    идём к ней случайной лесенкой и едим всё, на что наступили по дороге. Цель «съесть
+    всю активность» гарантирована: цикл крутится, пока остались непустые клетки.
+
+    Возвращает (cells, eaten_at) — путь и {клетка: индекс шага, на котором её съели}.
+    """
+    start_row = ROWS // 2
+    cells = [(-i, start_row) for i in range(LEAD, 0, -1)]
+    cur = cells[-1]
+    remaining = {(c, r) for c in range(COLS) for r in range(ROWS) if levels[c][r] > 0}
+    eaten_at = {}
+
+    while remaining:
+        target = min(
+            remaining,
+            key=lambda f: (abs(f[0] - cur[0]) + abs(f[1] - cur[1]), rng.random()),
+        )
+        while cur != target:
+            cur = _step_toward(cur, target, rng)
+            cells.append(cur)
+            if cur in remaining:          # съели попутную клетку — как в игре
+                eaten_at[cur] = len(cells) - 1
+                remaining.discard(cur)
+
+    # Выезд за правый край с той строки, где закончили.
+    for col in range(cur[0] + 1, COLS + LEAD):
+        cells.append((col, cur[1]))
+    return cells, eaten_at
 
 
 def render_svg(levels):
@@ -239,13 +284,14 @@ def render_svg(levels):
     height = GY + ROWS * C + 4
     size = C - PAD
 
-    path = snake_path()
-    steps = len(path) - 1
+    rng = random.Random(_seed_of(levels))
+    path, eaten_at = snake_path(levels, rng)
+    steps = max(1, len(path) - 1)
+    duration = min(DUR_MAX, max(DUR_MIN, steps * STEP_SEC))
     step_pct = 100.0 / steps
-    step_sec = SNAKE_DURATION / steps
-    idx_of = {cell: i for i, cell in enumerate(path) if 0 <= cell[0] < COLS}
+    step_sec = duration / steps
 
-    dur = _pct(SNAKE_DURATION)
+    dur = _pct(duration)
     css = [
         f".c{{animation-duration:{dur}s;animation-timing-function:linear;"
         f"animation-iteration-count:infinite}}",
@@ -279,11 +325,11 @@ def render_svg(levels):
                 )
                 continue
             # Непустая клетка гаснет ровно в тот момент, когда её проходит голова.
-            eaten_at = idx_of[(col, row)] * step_pct
-            regrow_at = min(100.0, eaten_at + step_pct * 0.8)
+            eat_pct = eaten_at[(col, row)] * step_pct
+            regrow_at = min(100.0, eat_pct + step_pct * 0.8)
             name = f"e{col}_{row}"
             css.append(
-                f"@keyframes {name}{{0%,{_pct(eaten_at)}%{{fill:{fill};opacity:1}}"
+                f"@keyframes {name}{{0%,{_pct(eat_pct)}%{{fill:{fill};opacity:1}}"
                 f"{_pct(regrow_at)}%,100%{{fill:{RAMP[0]};opacity:.2}}}}"
             )
             parts.append(
@@ -295,12 +341,29 @@ def render_svg(levels):
         baseline = GY + row * C + (C - PAD) - 2.5
         parts.append(f'<text x="3" y="{_fmt(baseline)}" font-size="9" fill="#8b95a1">{label}</text>')
 
+    # Рост: +1 сегмент за каждую съеденную клетку (как в оригинальной игре).
+    # Сегмент k >= BASE_LEN «рождается» в момент, когда съедена (k - BASE_LEN)-я клетка,
+    # и появляется у хвоста — там, где змейка в этот миг и удлиняется.
+    eat_order = sorted(eaten_at.values())
+    total_len = min(MAX_LEN, BASE_LEN + len(eat_order))
+
     # Хвост рисуем первым, голову — последней (поверх остальных сегментов).
-    for k in range(SNAKE_LEN - 1, -1, -1):
+    for k in range(total_len - 1, -1, -1):
+        op = 1.0 if k == 0 else max(0.5, 0.92 - k * 0.015)
+        rx = size / 2 if k == 0 else 3
+        if k < BASE_LEN:
+            style = f"animation-delay:{k * step_sec:.3f}s;opacity:{_pct(op)}"
+        else:
+            born = eat_order[k - BASE_LEN] * step_pct
+            css.append(
+                f"@keyframes g{k}{{0%,{_pct(born)}%{{opacity:0}}"
+                f"{_pct(min(100.0, born + step_pct * 0.5))}%,100%{{opacity:{_pct(op)}}}}}"
+            )
+            # Две анимации: путь (со сдвигом хвоста) и рождение (по абсолютному времени).
+            style = f"animation-name:snk,g{k};animation-delay:{k * step_sec:.3f}s,0s"
         parts.append(
-            f'<rect class="sg" style="animation-delay:{k * step_sec:.3f}s;'
-            f'opacity:{_pct(round(1.0 - k * 0.16, 2))}" x="0" y="0" '
-            f'width="{size}" height="{size}" rx="{_fmt(size / 2 if k == 0 else 3)}"/>'
+            f'<rect class="sg" style="{style}" x="0" y="0" '
+            f'width="{size}" height="{size}" rx="{_fmt(rx)}"/>'
         )
 
     css.append("@media(prefers-reduced-motion:reduce){.sg{display:none}.c{animation:none}}")
