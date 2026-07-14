@@ -209,9 +209,9 @@ def cell_xy(col, row):
 # ---- змейка (охотится за активностью и растёт, съедая её) ------------------------
 
 BASE_LEN = 4              # сегментов до первой еды (индекс 0 — голова)
-MAX_LEN_SPARSE = 20       # потолок роста на пустой сетке — рост видно, манёвра хватает
-MAX_LEN_DENSE = 6         # на забитой длинная змейка замуровывает сама себя
-DENSE_FOOD = 40           # граница «сетка забита» (клеток активности)
+MAX_LEN_SPARSE = 20       # потолок роста на разреженной активности — рост видно
+MAX_LEN_DENSE = 6         # в тесноте длинная змейка замуровывает сама себя
+DENSE_RATIO = 0.2         # граница «тесно»: доля еды внутри её собственного bbox
 STEP_SEC = 0.06           # секунд на шаг (темп); длительность = шаги * это, с зажимом
 DUR_MIN, DUR_MAX = 10.0, 30.0
 WIGGLE_P = 0.3            # шанс случайного поворота на прямом участке (иначе скучно)
@@ -234,15 +234,22 @@ def _seed_of(levels):
     return zlib.crc32(repr(levels).encode("utf-8"))
 
 
-def _max_len(food):
-    """Потолок роста — по плотности сетки, а не одной константой на все случаи.
+def _max_len(levels):
+    """Потолок роста — по ЛОКАЛЬНОЙ плотности активности (еда / её bbox).
 
-    Замер (свип по 4 сидам): при 60% плотности потолок 20 доедает 44% активности,
-    потолок 6 — 90%; на разреженной (наш случай: ~22 клетки) оба дают 100%. Поэтому
-    пока сетка пустая — растим длинно и это видно, а как забьётся — держим коротко,
-    иначе змейка в 7 строк высотой сама себя замуровывает.
+    Считать по глобальному числу клеток нельзя: на живых данных активность
+    кластерная (репо молодое — все коммиты в последних неделях), и 22 клетки лежали
+    в коробке 7x7 = локальная плотность 44%. Потолок 20 там доедал 10/22 и давал
+    самопересечения, потолок <=10 — 22/22 без единого. На равномерно разреженной
+    сетке, наоборот, 20 проходит на 100% и рост красиво видно.
     """
-    return MAX_LEN_SPARSE if food <= DENSE_FOOD else MAX_LEN_DENSE
+    food = [(c, r) for c in range(COLS) for r in range(ROWS) if levels[c][r] > 0]
+    if not food:
+        return MAX_LEN_SPARSE
+    cs = [c for c, _ in food]
+    rs = [r for _, r in food]
+    bbox = (max(cs) - min(cs) + 1) * (max(rs) - min(rs) + 1)
+    return MAX_LEN_SPARSE if len(food) / bbox <= DENSE_RATIO else MAX_LEN_DENSE
 
 
 def _in_grid(cell):
@@ -307,14 +314,18 @@ def snake_path(levels, rng):
     eaten_at = {}
     body = deque(cells)          # клетки, занятые змейкой (голова — последняя)
     body_len = BASE_LEN
-    max_len = _max_len(len(remaining))
+    max_len = _max_len(levels)
     guard = 40 * COLS * ROWS     # страховка от вечного цикла, если змейка заперлась
     stall = 0                    # подряд недостижимых целей — после 3 уходим с поля
 
-    def free(cell):
-        return _in_grid(cell) and cell not in body
+    def free(cell, out_ok=False):
+        if cell in body:
+            return False
+        if _in_grid(cell):
+            return True
+        return out_ok and cell[0] >= COLS      # за правый край можно только на выезде
 
-    def step_once(target, wiggle, budget_left):
+    def step_once(target, wiggle, budget_left, out_ok=False):
         """Один безопасный шаг к цели. False — ходить совсем некуда.
 
         Используется и на охоте, и на выезде: наивный «иди вправо» на выезде
@@ -336,13 +347,13 @@ def snake_path(levels, rng):
             side = [(c, r - 1), (c, r + 1)] if r == tr else [(c - 1, r), (c + 1, r)]
             rng.shuffle(side)
             prefer = side + prefer
-        prefer = [x for x in prefer if free(x)]
-        others = [x for x in _neighbors(cur) if free(x) and x not in prefer]
+        prefer = [x for x in prefer if free(x, out_ok)]
+        others = [x for x in _neighbors(cur) if free(x, out_ok) and x not in prefer]
         rng.shuffle(others)
 
         pick = None
         for x in prefer + others:          # сначала ходы, после которых видим хвост
-            if _is_safe(x, body, body_len, x in remaining):
+            if not _in_grid(x) or _is_safe(x, body, body_len, x in remaining):
                 pick = x
                 break
         if pick is None:                   # безопасных нет — хотя бы не в себя
@@ -383,21 +394,14 @@ def snake_path(levels, rng):
     # 100%->0% выглядит рывком.
     total_len = min(max_len, BASE_LEN + len(eaten_at))
 
-    # 1) К правому краю — тем же безопасным шагом: змейка могла доесть, свернувшись
-    #    клубком, и «иди вправо» напролом упирается в собственное тело.
-    edge_budget = 8 * COLS + 80
-    while _in_grid(cur) and cur[0] < COLS - 1 and edge_budget > 0:
-        edge_budget -= 1
-        if not step_once((COLS - 1, cur[1]), False, edge_budget):
+    # Выезжаем ТЕМ ЖЕ безопасным шагом: наивное «иди вправо» шло сквозь тело, если
+    # змейка доела, свернувшись клубком (на живых данных это давало 2 самопересечения).
+    exit_to = COLS + total_len + 1
+    exit_budget = 8 * (COLS + ROWS) + 200
+    while cur[0] < exit_to and exit_budget > 0:
+        exit_budget -= 1
+        if not step_once((exit_to, cur[1]), False, exit_budget, out_ok=True):
             break
-
-    # 2) Прямо за кадр: off-grid клетки телом не заняты, коллизий там нет.
-    while cur[0] < COLS + total_len + 1:
-        cur = (cur[0] + 1, cur[1])
-        cells.append(cur)
-        body.append(cur)
-        while len(body) > body_len:
-            body.popleft()
     return cells, eaten_at
 
 
@@ -474,8 +478,7 @@ def render_svg(levels):
     # Сегмент k >= BASE_LEN «рождается» в момент, когда съедена (k - BASE_LEN)-я клетка,
     # и появляется у хвоста — там, где змейка в этот миг и удлиняется.
     eat_order = sorted(eaten_at.values())
-    food_n = sum(1 for c in range(COLS) for r in range(ROWS) if levels[c][r] > 0)
-    total_len = min(_max_len(food_n), BASE_LEN + len(eat_order))
+    total_len = min(_max_len(levels), BASE_LEN + len(eat_order))
 
     # Змейка живёт строго в поле клеток: заезд/выезд за кадром обрезаются клипом,
     # иначе на старте она едет по зоне подписей дней.
